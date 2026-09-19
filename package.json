@@ -1,0 +1,1 @@
+{"name":"russkoe-pole","version":"1.0.0","private":true,"scripts":{"dev":"python3 server.py","build":"python3 build.py"}}

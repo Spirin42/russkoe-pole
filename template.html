@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#171b1e">
+  <meta name="description" content="Русское поле. Бесконечный фасад. Одно окно — одна жизнь.">
+  <title>Русское поле</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' fill='%23292e31'/%3E%3Cpath fill='%23dfb77b' d='M8 7h7v18H8zm9 0h7v18h-7z'/%3E%3C/svg%3E">
+  <style>/*__STYLE__*/</style>
+</head>
+<body>
+  <canvas id="field" tabindex="0" aria-label="Бесконечный фасад. Перемещайтесь стрелками. Enter или пробел переключает свет в центральной квартире. Плюс и минус меняют масштаб."></canvas>
+  <div id="vignette" aria-hidden="true"></div>
+  <header>
+    <h1><button class="title-button" id="project-info" aria-label="О проекте «Русское поле»">Русское поле</button></h1>
+    <button class="quiet mode" id="mode" hidden title="О проекте и состоянии соединения" aria-label="О проекте и состоянии соединения"><span class="status-dot"></span><span id="mode-label"></span></button>
+  </header>
+  <div id="focus-cell" aria-hidden="true"></div>
+  <div id="notice" role="status" aria-live="polite"></div>
+  <footer>
+    <div class="place"><span id="coordinates">0 · 0</span><span class="place-rule"></span><span id="scale-label">19%</span></div>
+    <div class="instructions" id="instructions"><span class="desktop-hint">Тяните поле · Нажмите на окно</span><span class="touch-hint">Двигайте поле · Коснитесь окна</span></div>
+  </footer>
+  <dialog id="about" aria-labelledby="about-title">
+    <button id="close-about" class="icon close" aria-label="Закрыть"><svg viewBox="0 0 24 24"><path d="m6 6 12 12M18 6 6 18"/></svg></button>
+    <p class="eyebrow">Диджитал-арт</p><h2 id="about-title">Русское поле</h2>
+    <p>Бесконечный фасад, за которым кто-то живет.</p>
+    <p>Нажмите на любую квартиру, чтобы зажечь или погасить свет. Двигайтесь в любом направлении — у поля нет края.</p>
+    <dl><dt>Мышь</dt><dd>Перетаскивание. Колесо — масштаб.</dd><dt>Клавиатура</dt><dd>Стрелки — движение. Enter — свет в центре. + / − — масштаб. Home — начало.</dd><dt>Телефон</dt><dd>Один палец — движение. Два — масштаб. Короткое касание — свет.</dd></dl>
+    <div class="connection"><span id="connection-title">Локальное поле</span><p id="connection-detail">Ваши изменения сохраняются в этом браузере. Общая карта доступна при запуске вместе с сервером проекта.</p></div>
+    <details><summary>Фотографии и фактуры</summary><div id="credits"><!--__CREDITS__--></div></details>
+  </dialog>
+  <script id="texture-data" type="application/json">/*__ASSETS__*/</script>
+  <script>/*__RENDERER__*/</script>
+  <script>/*__APP__*/</script>
+</body>
+</html>
