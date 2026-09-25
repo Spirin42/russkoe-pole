@@ -9,9 +9,10 @@
   <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' fill='%23292e31'/%3E%3Cpath fill='%23dfb77b' d='M8 7h7v18H8zm9 0h7v18h-7z'/%3E%3C/svg%3E">
   <style>/*__STYLE__*/</style>
 </head>
-<body>
-  <canvas id="field" tabindex="0" aria-label="Бесконечный фасад. Перемещайтесь стрелками. Enter или пробел переключает свет в центральной квартире. Плюс и минус меняют масштаб."></canvas>
+<body class="loading">
+  <div id="field" tabindex="0" role="application" aria-label="Бесконечный фасад. Перемещайтесь стрелками. Enter или пробел переключает свет в центральной квартире. Плюс и минус меняют масштаб."><div id="tiles"></div></div>
   <div id="vignette" aria-hidden="true"></div>
+  <div id="splash" aria-hidden="true">Русское поле</div>
   <header>
     <h1><button class="title-button" id="project-info" aria-label="О проекте «Русское поле»">Русское поле</button></h1>
     <button class="quiet mode" id="mode" hidden title="О проекте и состоянии соединения" aria-label="О проекте и состоянии соединения"><span class="status-dot"></span><span id="mode-label"></span></button>
@@ -20,7 +21,6 @@
   <div id="notice" role="status" aria-live="polite"></div>
   <footer>
     <div class="place"><span id="coordinates">0 · 0</span><span class="place-rule"></span><span id="scale-label">19%</span></div>
-    <div class="instructions" id="instructions"><span class="desktop-hint">Тяните поле · Нажмите на окно</span><span class="touch-hint">Двигайте поле · Коснитесь окна</span></div>
   </footer>
   <dialog id="about" aria-labelledby="about-title">
     <button id="close-about" class="icon close" aria-label="Закрыть"><svg viewBox="0 0 24 24"><path d="m6 6 12 12M18 6 6 18"/></svg></button>

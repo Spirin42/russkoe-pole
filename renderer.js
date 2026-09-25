@@ -1,8 +1,10 @@
-/* Deterministic photographic facade. No DOM dependencies; also renders in Node canvas. */
+/* Deterministic photographic facade. Renderer has no DOM dependencies and also renders in
+   Node canvas; Surface composites its tiles in the page. */
 (function (root) {
   'use strict';
   const W = 256, H = 224, WORLD = 'russkoe-pole-v1';
   const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+  const mod = (v, n) => (v % n + n) % n;
   function hash(x, y, salt = 0) {
     let n = (Math.imul(x | 0, 374761393) + Math.imul(y | 0, 668265263) + Math.imul(salt, 1442695041)) | 0;
     n = Math.imul(n ^ (n >>> 13), 1274126177);
@@ -174,21 +176,14 @@
     constructor(images, makeCanvas, options = {}) {
       this.images = images;
       this.canvas = makeCanvas;
-      this.maxResolution = options.maxResolution || 4;
-      // A byte budget lets thousands of small distant cells stay in memory.
-      this.cacheBudget = options.cacheBudget || 96 * 1024 * 1024;
-      this.cacheBytes = 0;
-      this.cache = new Map();
-      this.scene=null;this.filmPatterns=new WeakMap();
-      this.explicitInvalidation=!!options.explicitInvalidation;this.pendingInvalidations=new Map();
+      this.patterns=new WeakMap();this.dpr=options.dpr||1;
       this.variantCache=new Map();this.variantBytes=0;this.variantBudget=24*1024*1024;
-      this.jointCache=new Map();this.jointBytes=0;
+      this.jointCache=new Map();this.jointBytes=0;this.jointPool=new Map();this.jointBands=new Map();
       this.wallBaseCache=new Map();this.wallBaseBytes=0;
-      this.scheduleIdle=options.scheduleIdle;this.idleTask=null;this.prefetchQueue=[];this.prefetchStamp="";
       this.lightCache=new Map();this.lightBytes=0;this.lightBudget=32*1024*1024;
       this.apartmentCache=new Map();this.textureIds=new WeakMap();this.nextTextureId=1;this.glassMasks=new WeakMap();
-      this.farSprites=new Map();this.farSpriteBytes=0;this.farSpriteScale=.125;this.chunkSize=32;
-      this.film=this.filmTexture();this.weather=this.weatherTexture();this.weatherLevels=new Map([[512,this.weather]]);
+      this.sourcePixels=new WeakMap();
+      this.film=this.filmTexture();this.weather=this.weatherTexture();
       this.wallTextures = WALLS.map((r, i) => this.wallTexture(r, i));
       this.jointTexture=this.photoCut('evening',[82,856,210,16],736,420,32,0);
       this.windows = MAIN_WINDOWS.map(a=>this.windowTexture(a.index%9,Math.floor(a.index/9),a.panes));
@@ -440,194 +435,51 @@
       }
       g.putImageData(a,0,0);return c;
     }
-    gradeScene(g,regions) {
-      // Grade the combined photograph once. After a move/light change, clip
-      // the operation to newly painted rectangles; existing pixels stay intact.
-      if(regions&&!regions.length)return;
-      g.save();
-      if(regions){g.beginPath();for(const r of regions)g.rect(...r);g.clip();}
-      const w=g.canvas.width,h=g.canvas.height;
-      this.tint(g,0,0,w,h,'#858585',.15,'saturation');
-      this.tint(g,0,0,w,h,'#a6a69f',.16,'multiply');
-      this.tint(g,0,0,w,h,'#746e62',.17,'soft-light');g.restore();
-    }
-    finish(ctx,view,left,top) {
-      const {width,height,zoom,dpr=1}=view;
-      ctx.save();const span=4096,step=span*zoom;
-      const weatherSize=clamp(2**Math.ceil(Math.log2(step*dpr)),16,512);
-      if(!this.weatherLevels.has(weatherSize)){
-        const c=this.canvas(weatherSize,weatherSize),g=c.getContext('2d');g.imageSmoothingQuality='high';g.drawImage(this.weather,0,0,weatherSize,weatherSize);this.weatherLevels.set(weatherSize,c);
-      }
-      const weather=this.weatherLevels.get(weatherSize),sx=-((left%span+span)%span)*zoom,sy=-((top%span+span)%span)*zoom;
-      ctx.globalCompositeOperation='soft-light';ctx.globalAlpha=.48;
-      for(let y=sy;y<height;y+=step)for(let x=sx;x<width;x+=step)ctx.drawImage(weather,x,y,step+.4,step+.4);
-      let pattern=this.filmPatterns.get(ctx);
-      if(!pattern){pattern=ctx.createPattern(this.film,'repeat');this.filmPatterns.set(ctx,pattern);}
-      ctx.globalAlpha=.24;ctx.setTransform(dpr*.72,0,0,dpr*.72,0,0);ctx.fillStyle=pattern;
-      ctx.fillRect(0,0,width/.72,height/.72);ctx.restore();
-    }
-    sceneFor(bounds,scale,state,rasterScale) {
-      const {x0,x1,y0,y1}=bounds,tw=W*rasterScale,th=H*rasterScale;
-      let scene=this.scene;
-      if(!scene||scene.scale!==scale||scene.rasterScale!==rasterScale||x0<scene.x0||x1>scene.x1||y0<scene.y0||y1>scene.y1){
-        const old=scene;let margin=2;
-        while(margin>0&&(x1-x0+1+margin*2)*(y1-y0+1+margin*2)*tw*th*4>this.cacheBudget*.38)margin--;
-        const nx=x1-x0+1+margin*2,ny=y1-y0+1+margin*2;
-        const ox=Math.round((x0-margin)*tw),oy=Math.round((y0-margin)*th);
-        const c=this.canvas(Math.round((x1+margin+1)*tw)-ox,Math.round((y1+margin+1)*th)-oy),g=c.getContext('2d');
-        g.imageSmoothingEnabled=true;g.imageSmoothingQuality='high';
-        scene={canvas:c,scale,rasterScale,ox,oy,x0:x0-margin,x1:x1+margin,y0:y0-margin,y1:y1+margin,nx,ny,states:new Uint8Array(nx*ny)};
-        const reuse=old&&old.scale===scale&&old.rasterScale===rasterScale,painted=[];
-        if(reuse){g.imageSmoothingEnabled=false;g.drawImage(old.canvas,old.ox-ox,old.oy-oy);g.imageSmoothingEnabled=true;}
-        for(let y=scene.y0;y<=scene.y1;y++)for(let x=scene.x0;x<=scene.x1;x++){
-          const d=describe(x,y),on=state(d),i=(y-scene.y0)*nx+x-scene.x0;
-          scene.states[i]=on?1:0;
-          const oi=reuse?(y-old.y0)*old.nx+x-old.x0:-1;
-          if(reuse&&x>=old.x0&&x<=old.x1&&y>=old.y0&&y<=old.y1&&old.states[oi]===scene.states[i])continue;
-          const px=Math.round(x*tw)-ox,py=Math.round(y*th)-oy;
-          const rect=[px,py,Math.round((x+1)*tw)-ox-px,Math.round((y+1)*th)-oy-py];
-          g.drawImage(this.getCell(x,y,on,scale),...rect);painted.push(rect);
-        }
-        this.gradeScene(g,reuse?painted:null);
-        if(old){old.canvas.width=1;old.canvas.height=1;}
-        this.scene=scene;
-      }else{
-        const g=scene.canvas.getContext('2d'),painted=[];
-        const check=(x,y)=>{
-          const d=describe(x,y),on=state(d)?1:0,i=(y-scene.y0)*scene.nx+x-scene.x0;
-          if(scene.states[i]!==on){scene.states[i]=on;
-            const px=Math.round(x*tw)-scene.ox,py=Math.round(y*th)-scene.oy;
-            const rect=[px,py,Math.round((x+1)*tw)-scene.ox-px,Math.round((y+1)*th)-scene.oy-py];
-            g.drawImage(this.getCell(x,y,!!on,scale),...rect);painted.push(rect);
-          }
-        };
-        if(this.explicitInvalidation){
-          for(const {x,y} of this.pendingInvalidations.values())if(x>=scene.x0&&x<=scene.x1&&y>=scene.y0&&y<=scene.y1)check(x,y);
-        }else for(let y=y0;y<=y1;y++)for(let x=x0;x<=x1;x++)check(x,y);
-        this.gradeScene(g,painted);
-      }
-      this.pendingInvalidations.clear();
-      return scene;
-    }
-    prefetch(view,scale,state) {
-      if(!this.scheduleIdle)return;
-      const scene=this.scene,previous=this.lastPrefetchView;
-      const dx=previous?Math.sign(view.cx-previous.cx):0,dy=previous?Math.sign(view.cy-previous.cy):0;
-      this.lastPrefetchView={cx:view.cx,cy:view.cy};
-      if(!scene||scale>1){this.prefetchQueue=[];this.prefetchStamp='';return;}
-      const stamp=`${scene.x0},${scene.y0}:${scale}:${dx}:${dy}`;
-      if(stamp!==this.prefetchStamp){
-        this.prefetchStamp=stamp;const list=[],seen=new Set();
-        const add=(x,y)=>{const id=`${x},${y}`;if(!seen.has(id)){seen.add(id);list.push({x,y});}};
-        for(let n=1;n<=3;n++){
-          if(dx>=0)for(let y=scene.y0;y<=scene.y1;y++)add(scene.x1+n,y);
-          if(dx<=0)for(let y=scene.y0;y<=scene.y1;y++)add(scene.x0-n,y);
-          if(dy>=0)for(let x=scene.x0;x<=scene.x1;x++)add(x,scene.y1+n);
-          if(dy<=0)for(let x=scene.x0;x<=scene.x1;x++)add(x,scene.y0-n);
-        }
-        this.prefetchQueue=list.filter(({x,y})=>!this.cache.has(`${x},${y}:${state(describe(x,y))?1:0}:${scale}`));
-      }
-      this.prefetchState=state;this.prefetchScale=scale;
-      if(!this.idleTask&&this.prefetchQueue.length)this.queuePrefetch();
-    }
-    queuePrefetch() {
-      this.idleTask=true;
-      this.scheduleIdle(deadline=>{
-        this.idleTask=false;const start=Date.now();let count=0;
-        while(this.prefetchQueue.length&&count<4&&Date.now()-start<4&&deadline.timeRemaining()>1){
-          const {x,y}=this.prefetchQueue.shift(),d=describe(x,y);this.getCell(x,y,this.prefetchState(d),this.prefetchScale);count++;
-        }
-        if(this.prefetchQueue.length)this.queuePrefetch();
-      });
-    }
-    getCell(x, y, on, scale=1) {
-      const key=`${x},${y}:${on?1:0}:${scale}`;
-      if (this.cache.has(key)) {const c=this.cache.get(key);this.cache.delete(key);this.cache.set(key,c);return c;}
-      const c=this.renderCell(describe(x,y), on, scale);
-      return this.remember(key,c);
-    }
-    remember(key,c) {
-      this.cache.set(key,c);this.cacheBytes+=c.width*c.height*4;
-      const sceneBytes=this.scene?this.scene.canvas.width*this.scene.canvas.height*4:0;
-      const budget=Math.max(this.cacheBudget*.28,this.cacheBudget-sceneBytes);
-      while(this.cacheBytes>budget&&this.cache.size>1){const k=this.cache.keys().next().value;const old=this.cache.get(k);this.cache.delete(k);this.cacheBytes-=old.width*old.height*4;old.width=1;old.height=1;}
-      return c;
-    }
-    invalidateCell(x,y) {
-      if(this.explicitInvalidation)this.pendingInvalidations.set(`${x},${y}`,{x,y});
-      const prefix=`chunk:${Math.floor(x/this.chunkSize)},${Math.floor(y/this.chunkSize)}:`;
-      for(const [key,c]of this.cache)if(key.startsWith(prefix)){this.cache.delete(key);this.cacheBytes-=c.width*c.height*4;c.width=1;c.height=1;}
-    }
-    clearChunks() {
-      this.pendingInvalidations.clear();
-      if(this.scene){this.scene.canvas.width=1;this.scene.canvas.height=1;this.scene=null;}
-      for(const [key,c]of this.cache)if(key.startsWith('chunk:')){this.cache.delete(key);this.cacheBytes-=c.width*c.height*4;c.width=1;c.height=1;}
-    }
-    farSprite(key,paint) {
-      const scale=this.farSpriteScale;key=scale+':'+key;
-      if(this.farSprites.has(key)){const c=this.farSprites.get(key);this.farSprites.delete(key);this.farSprites.set(key,c);return c;}
-      const c=this.canvas(W*scale,H*scale),g=c.getContext('2d');g.scale(scale,scale);g.imageSmoothingQuality='high';paint(g);
-      this.farSprites.set(key,c);this.farSpriteBytes+=c.width*c.height*4;
-      while(this.farSpriteBytes>64*1024*1024){const k=this.farSprites.keys().next().value;const old=this.farSprites.get(k);this.farSprites.delete(k);this.farSpriteBytes-=old.width*old.height*4;old.width=1;old.height=1;}
-      return c;
-    }
-    drawDistant(g,d,on) {
-      // At less than 26 CSS pixels per apartment, reuse photographic layers.
-      // Every coordinate and light remains separate; only subpixel offsets are quantized.
-      const light=on?(d.purple?'purple':d.cool?'cool':`warm${Math.floor(d.r(84)*3)}`):'off';
-      if(!d.blank&&!d.balcony&&d.r(49)<.12){
-        const key=`apartment:${hash(d.x,d.y,88)%6}:${light}:${d.garland}`;
-        g.drawImage(this.farSprite(key,q=>this.drawApartment(q,d,on)),0,0,W,H);
-      }else{
-        const mosaic=d.r(51)<.68,exposure=Math.floor(d.r(52)*4),repaint=d.r(55)<.11?hash(d.x,d.y,56)%3:-1;
-        const wall=`wall:${mosaic}:${d.material}:${hash(d.x,d.y,50)%(mosaic?4:8)}:${exposure}:${repaint}`;
-        g.drawImage(this.farSprite(wall,q=>{
-          const background={...d,blank:true,balcony:false,r:s=>s===18||s===67?1:s===52?(exposure+.5)/4:d.r(s)};
-          const c=this.renderCell(background,false,.25);q.drawImage(c,0,0,W,H);c.width=1;c.height=1;
-        }),0,0,W,H);
-        if(!d.blank){
-          let key;
-          if(d.balcony){
-            const ref=d.r(91)<.46;
-            const candidates=(ref?this.referenceBalconies:this.mainBalconies).filter(b=>b.open===d.open);
-            const index=(ref?hash(d.x,d.y,92):d.balconyIndex)%candidates.length;
-            key=`balcony:${ref}:${d.open}:${index}:${hash(d.x,d.y,273)%8}:${light}:${d.garland}`;
-          }else{
-            const ref=d.r(89)<.56,index=ref?hash(d.x,d.y,90)%this.referenceWindows.length:hash(d.x,d.y,43)%this.windows.length;
-            key=`window:${ref}:${index}:${hash(d.x,d.y,271)%10}:${d.wide}:${light}:${d.garland}`;
-          }
-          g.drawImage(this.farSprite(key,q=>{
-            const centered={...d,r:s=>s===61||s===62?.5:d.r(s)};
-            d.balcony?this.drawBalcony(q,centered,on):this.drawWindow(q,centered,on);
-          }),0,0,W,H);
-          if(d.ac&&!d.balcony){
-            const key=`ac:${hash(d.x,d.y,76)%this.aircons.length}:${d.r(77)<.5}`;
-            g.drawImage(this.farSprite(key,q=>this.drawAircon(q,{...d,r:s=>s===78?.5:d.r(s)})),0,0,W,H);
-          }
-        }
-      }
-      if(d.r(67)<.16){
-        const band=Math.floor(d.r(80)*3);
-        g.drawImage(this.farSprite('cable:'+band,q=>this.drawCable(q,{...d,r:s=>s===80?(band+.5)/3:d.r(s)})),0,0,W,H);
-      }
-    }
-    getChunk(x,y,scale,state) {
-      const key=`chunk:${x},${y}:${scale}`;
-      if(this.cache.has(key)){const c=this.cache.get(key);this.cache.delete(key);this.cache.set(key,c);return c;}
-      const n=this.chunkSize,c=this.canvas(W*n*scale,H*n*scale),g=c.getContext('2d');
-      g.imageSmoothingEnabled=true;g.imageSmoothingQuality='high';
-      for(let yy=0;yy<n;yy++)for(let xx=0;xx<n;xx++){
-        const d=describe(x*n+xx,y*n+yy);
-        g.setTransform(scale,0,0,scale,xx*W*scale,yy*H*scale);this.drawDistant(g,d,state(d));
-      }
-      return this.remember(key,c);
+    finishCell(g,x,y,scale,px,py,top=0,bottom=Math.round(H*scale)) {
+      // The shared grade, weathering and grain belong to the photograph of the wall,
+      // not to the screen: they are painted once per cell and move with the facade.
+      const w=Math.round(W*scale),h=bottom-top;
+      g.save();g.setTransform(1,0,0,1,0,0);g.imageSmoothingEnabled=true;g.imageSmoothingQuality='high';
+      this.tint(g,px,py+top,w,h,'#858585',.15,'saturation');
+      this.tint(g,px,py+top,w,h,'#a6a69f',.16,'multiply');
+      this.tint(g,px,py+top,w,h,'#746e62',.17,'soft-light');
+      let patterns=this.patterns.get(g);
+      if(!patterns){patterns={weather:g.createPattern(this.weather,'repeat'),film:g.createPattern(this.film,'repeat')};this.patterns.set(g,patterns);}
+      g.globalCompositeOperation='soft-light';
+      // Weathering repeats every 4096 facade units from facade zero, 8 units per texel.
+      const k=8*scale,wx=mod(x*W,4096)/8,wy=mod(y*H,4096)/8;
+      g.globalAlpha=.48;g.fillStyle=patterns.weather;g.setTransform(k,0,0,k,px-wx*k,py-wy*k);g.fillRect(wx,wy+top/k,w/k,h/k);
+      // Grain is continuous across apartments. At the nominal zoom of every detail
+      // level a grain is .72 CSS px, the size of the former screen overlay.
+      const grain=.72*this.dpr,period=512*grain,gx=mod(x*w,period)/grain,gy=mod(y*Math.round(H*scale),period)/grain;
+      g.globalAlpha=.24;g.fillStyle=patterns.film;g.setTransform(grain,0,0,grain,px-gx*grain,py-gy*grain);g.fillRect(gx,gy+top/grain,w/grain,h/grain);
+      g.restore();
     }
     tint(g, x,y,w,h,color,alpha,mode='multiply') {
       g.save();g.globalAlpha=alpha;g.globalCompositeOperation=mode;g.fillStyle=color;g.fillRect(x,y,w,h);g.restore();
     }
-    renderCell(d, on, scale=1) {
-      const s=scale, c=this.canvas(Math.round(W*s),Math.round(H*s)),g=c.getContext('2d');
-      g.scale(s,s);g.imageSmoothingEnabled=true;g.imageSmoothingQuality='high';
+    paintCell(g,d,on,scale,px,py,top=0,bottom=Math.round(H*scale)) {
+      // Paint straight into a tile, clipped to the apartment as its own canvas used to be.
+      // A band of rows [top, bottom) lets a large apartment be painted over several frames.
+      g.save();g.setTransform(1,0,0,1,0,0);g.beginPath();g.rect(px,py+top,Math.round(W*scale),bottom-top);g.clip();
+      g.setTransform(scale,0,0,scale,px,py);g.imageSmoothingEnabled=true;g.imageSmoothingQuality='high';
+      this.drawCell(g,d,on,scale);g.restore();
+      this.finishCell(g,d.x,d.y,scale,px,py,top,bottom);
+    }
+    renderCell(d,on,scale=1) {
+      const c=this.canvas(Math.round(W*scale),Math.round(H*scale));
+      this.paintCell(c.getContext('2d'),d,on,scale,0,0);return c;
+    }
+    prepareCell(d,on,scale) {
+      // Every pixel readback an apartment needs happens here, before any of it is drawn. A
+      // readback waits for all drawing queued before it, and in Safari, and in Chrome with a
+      // GPU canvas, that drawing runs in another process: drawn first, it would stall this one.
+      if(d.blank)return;
+      if(!d.balcony&&d.r(49)<.12)this.apartmentPhoto(d,on);
+      else if(d.balcony){const [tex,glass]=this.balconyOf(d);this.relight(tex,d,on,true,glass,scale);}
+      else this.relight(this.windowOf(d)[1],d,on,false,null,scale);
+    }
+    drawCell(g,d,on,s) {
       g.imageSmoothingEnabled=false;g.drawImage(this.wallBase(d,s),0,0,W,H);g.imageSmoothingEnabled=true;
       // Exposure and repairs remain unique to every apartment.
       this.tint(g,0,0,W,H,'#303637',d.r(52)*.27);
@@ -649,7 +501,6 @@
         g.fillStyle='#252f33';g.fillRect(199,146,17,9);g.fillStyle='#96a09c66';g.fillRect(199,155,18,1);
       }
       if(d.r(67)<.16) this.drawCable(g,d);
-      return c;
     }
     wallBase(d,s) {
       const mosaic=d.r(51)<.68;
@@ -681,10 +532,18 @@
     drawJoint(g,axis,boundary,segment,position,length) {
       const scale=g.getTransform().a,key=`${axis}:${boundary}:${segment}:${scale}`;
       let c=this.jointCache.get(key);
-      if(!c){const pad=12;c=this.canvas(Math.ceil((axis?pad*2:length)*scale),Math.ceil((axis?length:pad*2)*scale));
-        const q=c.getContext('2d');q.scale(scale,scale);this.paintJoint(q,axis,boundary,segment,pad,length);
+      if(!c){
+        // Joint canvases of one size are reused: creating a canvas costs about as much as painting a joint.
+        const pad=12,w=Math.ceil((axis?pad*2:length)*scale),h=Math.ceil((axis?length:pad*2)*scale),pool=this.jointPool.get(w+'x'+h);
+        c=pool&&pool.pop();
+        if(c){const q=c.getContext('2d');q.setTransform(1,0,0,1,0,0);q.clearRect(0,0,w,h);}else c=this.canvas(w,h);
+        const q=c.getContext('2d');q.setTransform(scale,0,0,scale,0,0);this.paintJoint(q,axis,boundary,segment,pad,length);
         this.jointCache.set(key,c);this.jointBytes+=c.width*c.height*4;
-        while(this.jointBytes>8*1024*1024&&this.jointCache.size>1){const first=this.jointCache.keys().next().value,old=this.jointCache.get(first);this.jointCache.delete(first);this.jointBytes-=old.width*old.height*4;old.width=1;old.height=1;}
+        while(this.jointBytes>8*1024*1024&&this.jointCache.size>1){
+          const first=this.jointCache.keys().next().value,old=this.jointCache.get(first);this.jointCache.delete(first);this.jointBytes-=old.width*old.height*4;
+          const size=old.width+'x'+old.height,spare=this.jointPool.get(size)||[];
+          if(spare.length<64){spare.push(old);this.jointPool.set(size,spare);}else{old.width=1;old.height=1;}
+        }
       }else{this.jointCache.delete(key);this.jointCache.set(key,c);}
       g.drawImage(c,axis?position-12:0,axis?0:position-12,c.width/scale,c.height/scale);
     }
@@ -700,8 +559,11 @@
       // Weathered edges, a variable bead of mastic, then the recessed center.
       strip(3.2,'rgba(14,23,27,.09)');strip(1.4,'rgba(15,24,28,.17)');
       strip(0,repaired?'#777b70':'#4c5553');
+      // The texture band is the same in every joint of a level: it is resampled once, in the
+      // joint canvas's own transform, and laid on pixel for pixel.
+      const band=this.jointBand(g,length);
       g.save();g.clip();g.globalCompositeOperation='soft-light';g.globalAlpha=.83;
-      g.drawImage(this.jointTexture,0,-7,length,14);g.restore();
+      g.setTransform(1,0,0,1,0,0);g.drawImage(band,0,0);g.restore();
       g.beginPath();points.forEach((p,i)=>i?g.lineTo(p.t,p.center-.45):g.moveTo(p.t,p.center-.45));
       g.strokeStyle=repaired?'rgba(34,42,40,.19)':'rgba(15,24,28,.73)';g.lineWidth=repaired?.7:1.45;g.stroke();
       g.beginPath();points.forEach((p,i)=>i?g.lineTo(p.t,p.hi+.25):g.moveTo(p.t,p.hi+.25));
@@ -718,12 +580,18 @@
       }
       g.restore();
     }
+    jointBand(g,length) {
+      const m=g.getTransform(),w=g.canvas.width,h=g.canvas.height,key=[m.a,m.b,m.c,m.d,m.e,m.f,w,h].join();
+      let band=this.jointBands.get(key);
+      if(!band){band=this.canvas(w,h);const q=band.getContext('2d');q.setTransform(m.a,m.b,m.c,m.d,m.e,m.f);q.drawImage(this.jointTexture,0,-7,length,14);this.jointBands.set(key,band);}
+      return band;
+    }
     drawJoints(g,d) {
       this.drawJoint(g,0,d.y,d.x,0,W);this.drawJoint(g,0,d.y+1,d.x,H,W);
       this.drawJoint(g,1,d.x,d.y,0,H);this.drawJoint(g,1,d.x+1,d.y,W,H);
       if(d.r(749)<.30)this.runoff(g,d,5,4,W-10,23,.12);
     }
-    drawApartment(g,d,on){
+    apartmentPhoto(d,on){
       const index=hash(d.x,d.y,88)%this.apartments.length,key=index+':'+(on?(d.purple?'purple':d.cool?'cool':'warm'):'off');
       let c=this.apartmentCache.get(key);
       if(!c){
@@ -743,15 +611,21 @@
       }
       q.putImageData(pixels,0,0);this.apartmentCache.set(key,c);
       }
-      g.drawImage(c,0,0);
+      return c;
+    }
+    drawApartment(g,d,on){
+      g.drawImage(this.apartmentPhoto(d,on),0,0);
       if(on)this.glow(g,d,W*.21,H*.16,W*.6,H*.58,.18);
       if(d.garland)this.garland(g,d,W*.25,H*.26,W*.49,H*.24,on);
     }
-    drawWindow(g,d,on) {
+    windowOf(d) {
       const reference=d.r(89)<.56;
       const base=reference?this.referenceWindows[hash(d.x,d.y,90)%this.referenceWindows.length]:this.windows[hash(d.x,d.y,43)%this.windows.length];
       const choice=hash(d.x,d.y,271)%10,layout=choice<6?0:choice-5;
-      const texture=this.windowLayout(base,layout);
+      return [base,this.windowLayout(base,layout)];
+    }
+    drawWindow(g,d,on) {
+      const [base,texture]=this.windowOf(d);
       const wh=116+d.r(278)*8,ww=clamp((d.wide?125:108)*texture.width/base.width,66,196);
       const x=(W-ww)/2+(d.r(61)-.5)*8,y=34+(d.r(62)-.5)*5;
       const setting=this.windowSurrounds[hash(d.x,d.y,151)%this.windowSurrounds.length],o=setting.opening;
@@ -778,12 +652,16 @@
       rad.addColorStop(0,`rgba(${color},${alpha})`);rad.addColorStop(.48,`rgba(${color},${alpha*.60})`);rad.addColorStop(.76,`rgba(${color},${alpha*.22})`);rad.addColorStop(1,`rgba(${color},0)`);
       g.fillStyle=rad;g.fillRect(x-w*.4,y-h*.3,w*1.8,h*1.6);g.restore();
     }
-    drawBalcony(g,d,on) {
+    balconyOf(d) {
       let tex,glass;
       if(d.r(91)<.46){const candidates=this.referenceBalconies.filter(b=>b.open===d.open),a=candidates[hash(d.x,d.y,92)%candidates.length];tex=a.texture;glass=a.glass;}
       else{const candidates=this.mainBalconies.filter(b=>b.open===d.open),a=candidates[d.balconyIndex%candidates.length];tex=a.texture;glass=a.glass;}
+      const finish=hash(d.x,d.y,273)%8;
+      return [this.balconyFinish(tex,finish<4?0:finish-3,glass),glass];
+    }
+    drawBalcony(g,d,on) {
+      const [tex,glass]=this.balconyOf(d);
       const depth=6+d.r(153)*3,drop=3.5+d.r(154)*2;
-      const finish=hash(d.x,d.y,273)%8;tex=this.balconyFinish(tex,finish<4?0:finish-3,glass);
       const lit=this.relight(tex,d,on,true,glass,g.getTransform().a),masonry=this.wallTextures[hash(d.x,d.y,155)%this.wallTextures.length];
       // Contain the entire balcony. No cover crop may cut through a frame or pane.
       const ratio=tex.width/tex.height,h=Math.min(d.open?151:169,210/ratio),w=h*ratio;
@@ -825,7 +703,13 @@
         return this.registerGlass(c,this.glassMasks.get(original).panes);
       });}
       const w=texture.width,h=texture.height,c=this.canvas(w,h),g=c.getContext('2d',{willReadFrequently:true});
-      g.drawImage(texture,0,0);const a=g.getImageData(0,0,w,h),p=a.data;
+      // Each photograph is read back once; every light of it starts from that copy, since a
+      // readback waits for all queued drawing. The photograph is still drawn first: Chrome
+      // samples a canvas filled only by putImageData differently when it is scaled into a tile.
+      const kept=this.sourcePixels.get(texture);let a;g.drawImage(texture,0,0);
+      if(kept){a=g.createImageData(w,h);a.data.set(kept);}
+      else{a=g.getImageData(0,0,w,h);this.sourcePixels.set(texture,a.data.slice());}
+      const p=a.data;
       const warm=d.purple?[240,134,246]:d.cool?[238,246,225]:[255,206+Math.floor(d.r(84)*3)*10,123+Math.floor(d.r(84)*3)*9];
       const glazing=this.glassMasks.get(texture);
       if(!glazing)throw Error('Missing pane mask for photographic asset');
@@ -860,37 +744,277 @@
       const colors=['#e9b876','#b8c9b1','#c39680','#d7cdb1'];
       for(let i=0;i<11;i++) {const t=i/10,yy=y+18*2*t*(1-t);g.fillStyle=on?colors[i%4]:'#959381';g.shadowColor=on?colors[i%4]:'transparent';g.shadowBlur=on?4*g.getTransform().a:0;g.fillRect(x+t*w,yy,1.5,2.4);}g.restore();
     }
-    draw(ctx, view, state) {
-      const {width,height,zoom,cx,cy,dpr=1}=view;
-      ctx.setTransform(dpr,0,0,dpr,0,0);ctx.fillStyle='#3b464e';ctx.fillRect(0,0,width,height);
-      ctx.imageSmoothingEnabled=true;ctx.imageSmoothingQuality='high';
-      const left=cx-width/(2*zoom),top=cy-height/(2*zoom);
-      const x0=Math.floor(left/W),x1=Math.floor((left+width/zoom)/W),y0=Math.floor(top/H),y1=Math.floor((top+height/zoom)/H);
-      const levels=[.015625,.03125,.0625,.125,.1875,.25,.375,.5,.75,1,1.25,1.5,2,3,4];
-      let level=levels.findIndex(s=>s>=Math.min(zoom*dpr,this.maxResolution));
-      const n=this.chunkSize;
-      const count=zoom<.1?(Math.floor(x1/n)-Math.floor(x0/n)+1)*(Math.floor(y1/n)-Math.floor(y0/n)+1)*n*n:(x1-x0+1)*(y1-y0+1);
-      // Fit the entire visible frame, including headroom for panning, on large displays.
-      while(level>0&&count*W*H*levels[level]**2*4>this.cacheBudget*.72)level--;
-      const scale=levels[level];
-      if(zoom<.1){
-        this.farSpriteScale=clamp(2**Math.ceil(Math.log2(scale)),.0625,.25);
-        const n=this.chunkSize,cw=W*n,ch=H*n;
-        for(let y=Math.floor(y0/n);y<=Math.floor(y1/n);y++)for(let x=Math.floor(x0/n);x<=Math.floor(x1/n);x++){
-          const tile=this.getChunk(x,y,scale,state);
-          ctx.drawImage(tile,(x*cw-left)*zoom,(y*ch-top)*zoom,cw*zoom+.15,ch*zoom+.15);
-        }
-        this.gradeScene(ctx);this.finish(ctx,view,left,top);return{x0,x1,y0,y1};
+  }
+
+  // Device pixels per facade unit. Every level has whole-pixel apartments.
+  const LEVELS=[.03125,.0625,.125,.1875,.25,.375,.5,.75,1,1.25,1.5,2,3,4];
+  const EMPTY=0,OFF=2,ON=3,STALE=4;
+  const fresh=s=>s===OFF||s===ON;
+  // The browser composites finished tiles. Panning and zooming within a detail level only
+  // move DOM layers; canvas pixels are painted once, when an apartment is first needed or its
+  // light changes. The picture on screen is always complete: apartments are prepared ahead of
+  // the camera, and one that is not ready when it comes into view is painted before that frame.
+  class Surface {
+    constructor(renderer,root,options={}) {
+      this.renderer=renderer;this.root=root;
+      this.budget=options.budget||256*1024*1024;this.maxResolution=options.maxResolution||4;
+      this.layers=new Map();this.display=null;this.target=null;this.over=null;this.bytes=0;this.frame=0;this.stepCost=2;
+      this.shown=false;this.moved=0;this.zoomed=0;this.camera=null;this.heading={x:0,y:0};
+      this.interval=1000/60;this.recent=new Float64Array(60);this.count=0;this.last=0;this.share=.4;this.worked=false;
+    }
+    fits(view,s) {
+      // On large displays keep the visible frame, at two levels during a zoom, inside the budget.
+      const {width,height,zoom}=view,cells=(width/(W*zoom)+1)*(height/(H*zoom)+1);
+      return cells*W*H*s*s*4<=this.budget*.35;
+    }
+    level(view) {
+      const {zoom,dpr}=view;
+      let i=LEVELS.findIndex(s=>s>=Math.min(zoom*dpr,this.maxResolution));if(i<0)i=LEVELS.length-1;
+      while(i>0&&!this.fits(view,LEVELS[i]))i--;
+      // A slight zoom out keeps the current level, reduced by the compositor down to .7 of its
+      // resolution, instead of repainting every apartment on screen at the level below.
+      const current=this.display&&this.display.s;
+      return current>LEVELS[i]&&zoom*dpr>=current*.7&&this.fits(view,current)?current:LEVELS[i];
+    }
+    layer(s,view) {
+      let layer=this.layers.get(s);
+      if(!layer){
+        const el=document.createElement('div');el.className='layer';
+        // Large apartments are prepared ahead in bands of about 110k pixels, one band per step.
+        const bands=Math.max(1,Math.ceil(W*s*H*s/110000));
+        layer={s,cw:W*s,ch:H*s,n:clamp(Math.floor(512/Math.max(W*s,H*s)),1,16),bands,band:Math.ceil(H*s/bands),tiles:new Map(),attached:new Set(),el,ox:0,oy:0,transform:''};
+        this.rebase(layer,view);this.layers.set(s,layer);
       }
-      // A stable backing resolution lets wheel/pinch zoom reuse the assembled
-      // facade. The final draw performs the continuous camera transform.
-      const scene=this.sceneFor({x0,x1,y0,y1},scale,state,scale);
-      const factor=zoom/scene.rasterScale;
-      ctx.drawImage(scene.canvas,scene.ox*factor-left*zoom,scene.oy*factor-top*zoom,scene.canvas.width*factor,scene.canvas.height*factor);
-      this.finish(ctx,view,left,top);
-      this.prefetch(view,scale,state);
-      return {x0,x1,y0,y1};
+      return layer;
+    }
+    rebase(layer,view) {
+      // CSS positions stay small next to the camera, even two billion apartments away.
+      layer.ox=Math.floor(view.cx/W);layer.oy=Math.floor(view.cy/H);
+      for(const t of layer.tiles.values())this.place(t);
+    }
+    place(t) {
+      const l=t.layer,dpr=this.renderer.dpr;
+      t.canvas.style.left=(t.tx*l.n-l.ox)*l.cw/dpr+'px';t.canvas.style.top=(t.ty*l.n-l.oy)*l.ch/dpr+'px';
+    }
+    tile(layer,tx,ty) {
+      const key=tx+','+ty;let t=layer.tiles.get(key);
+      if(!t){
+        const n=layer.n,dpr=this.renderer.dpr,c=this.renderer.canvas(n*layer.cw,n*layer.ch);
+        c.style.width=c.width/dpr+'px';c.style.height=c.height/dpr+'px';
+        t={layer,tx,ty,key,canvas:c,g:c.getContext('2d'),states:new Uint8Array(n*n),todo:n*n,used:this.frame};
+        layer.tiles.set(key,t);this.place(t);layer.el.appendChild(c);layer.attached.add(t);this.bytes+=c.width*c.height*4;
+      }
+      return t;
+    }
+    cellState(layer,x,y) {
+      const n=layer.n,t=layer.tiles.get(Math.floor(x/n)+','+Math.floor(y/n));
+      return t?t.states[(y-t.ty*n)*n+x-t.tx*n]:EMPTY;
+    }
+    prepare(layer,x,y,state) {
+      const s=this.cellState(layer,x,y);if(fresh(s))return;
+      const d=describe(x,y),on=state(d);
+      if(!(s&STALE)||(s&3)!==(on?ON:OFF))this.renderer.prepareCell(d,on,layer.s);
+    }
+    settle(layer,x,y,state,whole) {
+      // One step towards showing the current light of this apartment: the whole
+      // apartment, or the next band of a large one.
+      const n=layer.n,t=this.tile(layer,Math.floor(x/n),Math.floor(y/n)),i=(y-t.ty*n)*n+x-t.tx*n,was=t.states[i];
+      if(fresh(was))return true;
+      const d=describe(x,y),want=state(d)?ON:OFF;
+      if((was&STALE)&&(was&3)===want){t.states[i]=want;t.todo--;return true;}
+      const px=(i%n)*layer.cw,py=Math.floor(i/n)*layer.ch,part=t.partial&&t.partial.get(i);
+      const first=part&&part.want===want?part.band:0,last=whole?layer.bands:first+1;
+      this.renderer.paintCell(t.g,d,want===ON,layer.s,px,py,first*layer.band,Math.min(layer.ch,last*layer.band));
+      if(last<layer.bands){(t.partial||(t.partial=new Map())).set(i,{band:last,want});return false;}
+      if(part)t.partial.delete(i);
+      t.todo--;t.states[i]=want;return true;
+    }
+    uncover(x,y) {
+      // An out-of-date apartment on the level kept on top gives way to the level beneath.
+      const l=this.over,n=l.n,t=l.tiles.get(Math.floor(x/n)+','+Math.floor(y/n));if(!t)return;
+      const i=(y-t.ty*n)*n+x-t.tx*n;
+      t.g.save();t.g.setTransform(1,0,0,1,0,0);t.g.clearRect((i%n)*l.cw,Math.floor(i/n)*l.ch,l.cw,l.ch);t.g.restore();
+      t.states[i]=EMPTY;if(t.partial)t.partial.delete(i);
+    }
+    complete(layer,box,state) {
+      const cells=this.pending(layer,box,0,0);
+      for(const {x,y} of cells)this.prepare(layer,x,y,state);
+      for(const {x,y} of cells)this.settle(layer,x,y,state,true);
+    }
+    mark(layer,x,y) {
+      const n=layer.n,t=layer.tiles.get(Math.floor(x/n)+','+Math.floor(y/n));if(!t)return;
+      const i=(y-t.ty*n)*n+x-t.tx*n,s=t.states[i];
+      if(fresh(s)){t.states[i]=s|STALE;t.todo++;}
+    }
+    invalidate(x,y) {
+      // The apartment is repainted before the next frame if it is on screen, later otherwise.
+      for(const layer of this.layers.values())this.mark(layer,x,y);
+    }
+    reset() {
+      // Every light may have changed (local <-> shared field): each apartment is rechecked
+      // before it is shown again.
+      for(const layer of this.layers.values())for(const t of layer.tiles.values())
+        for(let i=0;i<t.states.length;i++)if(fresh(t.states[i])){t.states[i]|=STALE;t.todo++;}
+    }
+    pending(layer,box,cx,cy) {
+      // Apartments of the box whose pixels in this layer are missing or out of date, nearest first.
+      const n=layer.n,list=[];
+      for(let ty=Math.floor(box.y0/n);ty<=Math.floor(box.y1/n);ty++)for(let tx=Math.floor(box.x0/n);tx<=Math.floor(box.x1/n);tx++){
+        const t=layer.tiles.get(tx+','+ty);if(t&&!t.todo)continue;
+        const xa=Math.max(box.x0,tx*n),xb=Math.min(box.x1,tx*n+n-1),ya=Math.max(box.y0,ty*n),yb=Math.min(box.y1,ty*n+n-1);
+        for(let y=ya;y<=yb;y++)for(let x=xa;x<=xb;x++){
+          if(box.skip&&x>=box.skip.x0&&x<=box.skip.x1&&y>=box.skip.y0&&y<=box.skip.y1)continue;
+          if(t&&fresh(t.states[(y-ty*n)*n+x-tx*n]))continue;
+          const dx=(x+.5)*W-cx,dy=(y+.5)*H-cy;list.push({x,y,d:dx*dx+dy*dy});
+        }
+      }
+      return list.sort((a,b)=>a.d-b.d);
+    }
+    sync(layer,box) {
+      const n=layer.n,tx0=Math.floor(box.x0/n),tx1=Math.floor(box.x1/n),ty0=Math.floor(box.y0/n),ty1=Math.floor(box.y1/n);
+      for(const t of layer.attached)if(t.tx<tx0||t.tx>tx1||t.ty<ty0||t.ty>ty1){t.canvas.remove();layer.attached.delete(t);}
+      for(let ty=ty0;ty<=ty1;ty++)for(let tx=tx0;tx<=tx1;tx++){
+        const t=layer.tiles.get(tx+','+ty);if(!t)continue;
+        t.used=this.frame;if(!layer.attached.has(t)){layer.el.appendChild(t.canvas);layer.attached.add(t);}
+      }
+    }
+    position(layer,view,left,top) {
+      const {zoom,dpr}=view;
+      if(Math.abs(view.cx/W-layer.ox)>1e3||Math.abs(view.cy/H-layer.oy)>1e3)this.rebase(layer,view);
+      // Whole device pixels keep a still image crisp; the scale is the rest of the zoom.
+      const x=Math.round((layer.ox*W-left)*zoom*dpr)/dpr,y=Math.round((layer.oy*H-top)*zoom*dpr)/dpr;
+      const transform=`translate(${x}px,${y}px) scale(${zoom*dpr/layer.s})`;
+      if(transform!==layer.transform){layer.el.style.transform=transform;layer.transform=transform;}
+    }
+    arrange() {
+      // The displayed level, and during a zoom out the previous level on top of it; a level
+      // being prepared waits off the page.
+      const want=this.shown?[this.display,this.over].filter(Boolean):[];
+      for(const layer of this.layers.values())if(layer.el.parentNode&&!want.includes(layer))layer.el.remove();
+      let prev=null;
+      for(const layer of want){const after=prev?prev.nextSibling:this.root.firstChild;if(layer.el!==after)this.root.insertBefore(layer.el,after);prev=layer.el;}
+    }
+    drop(t) {
+      const l=t.layer;t.canvas.remove();l.attached.delete(t);l.tiles.delete(t.key);
+      this.bytes-=t.canvas.width*t.canvas.height*4;t.canvas.width=0;t.canvas.height=0;
+    }
+    evict() {
+      if(this.bytes<=this.budget)return;
+      const spare=[];
+      for(const layer of this.layers.values()){const live=layer===this.display||layer===this.target||layer===this.over;for(const t of layer.tiles.values())if(!live||!layer.attached.has(t))spare.push(t);}
+      spare.sort((a,b)=>a.used-b.used);
+      for(const t of spare){if(this.bytes<=this.budget*.9)break;this.drop(t);}
+      for(const [s,layer]of this.layers)if(!layer.tiles.size&&layer!==this.display&&layer!==this.target&&layer!==this.over){layer.el.remove();this.layers.delete(s);}
+    }
+    clear(dpr) {
+      // Tile sizes and grain are tied to the pixel density.
+      for(const layer of this.layers.values()){for(const t of [...layer.tiles.values()])this.drop(t);layer.el.remove();}
+      this.layers.clear();this.display=this.target=this.over=null;this.renderer.dpr=dpr;
+    }
+    reach(view,dx,dy) {
+      // The share of a programmatic move (an inertial fling) that keeps every apartment in the
+      // frame among those already prepared: such a move never has to wait for painting.
+      const layer=this.display;if(!this.shown||!layer)return 1;
+      const frame=v=>{const left=v.cx-v.width/(2*v.zoom),top=v.cy-v.height/(2*v.zoom);return{x0:Math.floor(left/W),x1:Math.floor((left+v.width/v.zoom)/W),y0:Math.floor(top/H),y1:Math.floor((top+v.height/v.zoom)/H)};};
+      const now=frame(view),painted=(l,x,y)=>l&&(this.cellState(l,x,y)&3)>=OFF;
+      const ready=t=>{
+        const b=frame({width:view.width,height:view.height,zoom:view.zoom,cx:view.cx+dx*t,cy:view.cy+dy*t});
+        for(let y=b.y0;y<=b.y1;y++)for(let x=b.x0;x<=b.x1;x++){
+          if(x>=now.x0&&x<=now.x1&&y>=now.y0&&y<=now.y1)continue;
+          if(!painted(layer,x,y)&&!painted(this.over,x,y))return false;
+        }
+        return true;
+      };
+      if(ready(1))return 1;
+      let lo=0,hi=1;for(let i=0;i<8;i++){const mid=(lo+hi)/2;if(ready(mid))lo=mid;else hi=mid;}
+      return lo;
+    }
+    ahead(box,layer) {
+      // Apartments prepared around the frame: a margin on every side and more in the direction
+      // of travel, as much as the tile budget allows.
+      const cols=box.x1-box.x0+1,rows=box.y1-box.y0+1,{x:hx,y:hy}=this.heading,cell=layer.cw*layer.ch*4;
+      for(let f=1;;f*=.8){
+        const mx=Math.max(1,Math.round(clamp(Math.ceil(cols*.3),2,10)*f)),my=Math.max(1,Math.round(clamp(Math.ceil(rows*.25),2,8)*f));
+        const ax=Math.round(clamp(Math.ceil(cols*.5),3,14)*f),ay=Math.round(clamp(Math.ceil(rows*.4),3,12)*f);
+        const near={x0:box.x0-mx-(hx<0?ax:0),x1:box.x1+mx+(hx>0?ax:0),y0:box.y0-my-(hy<0?ay:0),y1:box.y1+my+(hy>0?ay:0),skip:box};
+        if((near.x1-near.x0+1)*(near.y1-near.y0+1)*cell<=this.budget*.55||f<.2)return near;
+      }
+    }
+    update(view,state,now=performance.now()) {
+      const {width,height,zoom,cx,cy,dpr}=view,start=performance.now();
+      if(dpr!==this.renderer.dpr)this.clear(dpr);
+      this.frame++;
+      // The share of a frame given to preparing ahead follows what the device really manages:
+      // canvas rasterization may happen after the script, so frame lengths are the measure. The
+      // refresh rate itself can change (ProMotion, Low Power Mode), so the frame interval is the
+      // shortest of the last 60 frames.
+      const dt=now-this.last;
+      if(this.last&&dt>4&&dt<100){
+        this.recent[this.count++%60]=dt;
+        let shortest=Infinity;for(const v of this.recent)if(v&&v<shortest)shortest=v;
+        this.interval=Math.max(1000/144,shortest);
+        if(this.worked)this.share=dt>this.interval*1.6?Math.max(.12,this.share*.8):Math.min(.6,this.share+.01);
+      }
+      this.last=now;
+      const c=this.camera;
+      if(!c||c.cx!==cx||c.cy!==cy||c.zoom!==zoom||c.width!==width||c.height!==height){
+        if(c&&(c.cx!==cx||c.cy!==cy))this.heading={x:Math.sign(cx-c.cx),y:Math.sign(cy-c.cy)};
+        if(c){this.moved=now;if(c.zoom!==zoom)this.zoomed=now;}this.camera={cx,cy,zoom,width,height};
+      }
+      const left=cx-width/(2*zoom),top=cy-height/(2*zoom);
+      const box={x0:Math.floor(left/W),x1:Math.floor((left+width/zoom)/W),y0:Math.floor(top/H),y1:Math.floor((top+height/zoom)/H)};
+      // While a zoom-in continues, the current level is magnified up to twice by the
+      // compositor instead of preparing every intermediate level along the way.
+      const target=this.level(view);let shown=this.display;
+      const hold=!!shown&&target>shown.s&&now-this.zoomed<150&&zoom*dpr<=shown.s*2;
+      const next=hold?shown:this.layer(target,view);
+      if(!shown)shown=this.display=next;
+      else if(next.s<shown.s){
+        // Zooming out, the current level stays on top, reduced by the compositor, and only the
+        // apartments it does not show are painted at once, at the new level beneath it.
+        if(!this.over&&this.fits(view,shown.s))this.over=shown;
+        shown=this.display=next;
+      }else if(this.over&&next!==shown){
+        // Zooming in again before the level beneath was complete: complete it first.
+        this.complete(shown,box,state);this.over=null;
+      }
+      // Zooming in, the current level stays magnified on screen until the new one is complete.
+      this.target=next;
+      const near=this.ahead(box,shown);
+      // Phase one reads every pixel this frame needs, before anything is drawn; phase two draws.
+      const must=[];
+      if(this.shown)for(const cell of this.pending(shown,box,cx,cy)){
+        if(this.over){const s=this.cellState(this.over,cell.x,cell.y);if(fresh(s))continue;if(s!==EMPTY)this.uncover(cell.x,cell.y);}
+        must.push(cell);
+      }
+      // The first picture covers the frame and one ring around it; the rest follows at once.
+      const reveal={x0:box.x0-1,x1:box.x1+1,y0:box.y0-1,y1:box.y1+1};
+      const [layer,todo]=!this.shown?[shown,this.pending(shown,reveal,cx,cy)]:this.over?[shown,this.pending(shown,box,cx,cy)]:next!==shown?[next,this.pending(next,box,cx,cy)]:[shown,this.pending(shown,near,cx,cy)];
+      const budget=!this.shown?48:clamp(this.interval*this.share*(now-this.moved<250?1:1.5),1.5,12),deadline=start+budget;
+      for(const {x,y} of must)this.prepare(shown,x,y,state);
+      let planned=0;
+      while(planned<todo.length&&(!planned||performance.now()+this.stepCost*layer.bands*(planned+1)<=deadline))this.prepare(layer,todo[planned].x,todo[planned++].y,state);
+      for(const {x,y} of must)this.settle(shown,x,y,state,true);
+      const paint=performance.now();let steps=0,done=0;
+      for(;done<planned;done++){
+        let complete=false;
+        while(!(complete=this.settle(layer,todo[done].x,todo[done].y,state))&&performance.now()<=deadline)steps++;
+        steps++;if(!complete||performance.now()>deadline){if(complete)done++;break;}
+      }
+      if(steps)this.stepCost=this.stepCost*.8+(performance.now()-paint)/steps*.2;
+      const rest=todo.length-done;
+      if(!rest){
+        if(!this.shown)this.shown=true;
+        else if(this.over)this.over=null;
+        else if(next!==shown)shown=this.display=next;
+      }
+      this.sync(shown,this.shown?near:reveal);this.position(shown,view,left,top);
+      if(this.over){this.sync(this.over,box);this.position(this.over,view,left,top);}
+      if(next!==shown){this.sync(next,box);this.position(next,view,left,top);}
+      this.arrange();this.evict();
+      this.worked=this.shown&&!must.length&&steps>0;
+      return !this.shown||rest>0||next!==shown||hold||!!this.over;
     }
   }
-  root.Pole={W,H,WORLD,hash,random,describe,Renderer,clamp};
+  root.Pole={W,H,WORLD,hash,random,describe,Renderer,Surface,clamp};
 })(typeof module!=='undefined'?module.exports:window);

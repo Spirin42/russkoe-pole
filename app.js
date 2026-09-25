@@ -1,8 +1,8 @@
 (async function () {
   'use strict';
-  const {W,H,WORLD,describe,Renderer,clamp} = Pole;
+  const {W,H,WORLD,describe,Renderer,Surface,clamp} = Pole;
   const $=id=>document.getElementById(id);
-  const canvas=$('field'),ctx=canvas.getContext('2d',{alpha:false}),about=$('about');
+  const field=$('field'),about=$('about');
   const reduced=matchMedia('(prefers-reduced-motion: reduce)').matches;
   const coarse=matchMedia('(pointer: coarse)').matches;
   const MIN_ZOOM=.18,HOME_ZOOM=.19,ZOOM_REVISION=4;
@@ -11,7 +11,7 @@
   const storeKey=WORLD+':lights',cameraKey=WORLD+':camera',pendingKey=WORLD+':pending';
   const local=new Map(),remote=new Map(),versions=new Map(),confirmed=new Set(),pendingSnapshots=new Map();
   const pointers=new Map(),keys=new Set(),outbox=[];
-  let renderer,frame=0,lastTime=0,dirty=true,velocity={x:0,y:0},drag=null,pinch=null,multi=false;
+  let surface,busy=false,frame=0,lastTime=0,dirty=true,velocity={x:0,y:0},drag=null,pinch=null,multi=false;
   let pointerMoved=false,noticeTimer,cameraTimer,localTimer,viewportTimer,viewportAbort;
   let mode='local',stream=null,streamTimer,pollTimer,sending=false,remoteReady=false;
   let storageOK=true,channel=null,activeBounds=null,activeSnapshot=null,loadSerial=0;
@@ -39,14 +39,14 @@
     for(const p of outbox)if(p.x===d.x&&p.y===d.y&&!confirmed.has(p.id))on=!on;
     return on;
   }
-  function changed(d,before){if(before!==state(d))renderer?.invalidateCell(d.x,d.y);invalidate();}
+  function changed(d,before){if(before!==state(d))surface?.invalidate(d.x,d.y);invalidate();}
   function saveLocal(){clearTimeout(localTimer);localTimer=setTimeout(()=>{try{localStorage.setItem(storeKey,JSON.stringify([...local]));}catch{if(storageOK)tell('Браузер не разрешил сохранить изменения.');storageOK=false;}},80);}
   function savePending(){try{localStorage.setItem(pendingKey,JSON.stringify(outbox));}catch{}}
   function saveCamera(){clearTimeout(cameraTimer);cameraTimer=setTimeout(()=>{try{localStorage.setItem(cameraKey,JSON.stringify({cx:view.cx,cy:view.cy,zoom:view.zoom,zoomRevision:ZOOM_REVISION}));}catch{}},300);}
   try{channel=new BroadcastChannel(WORLD);channel.onmessage=e=>{const {x,y,on}=e.data||{};if(mode!=='local'||!validCoord(x)||!validCoord(y)||typeof on!=='boolean')return;const d=describe(x,y),before=state(d);local.set(d.id,on);changed(d,before);};}catch{}
   addEventListener('storage',e=>{if(e.key!==storeKey||mode!=='local')return;const entries=safeRead(storeKey);if(!Array.isArray(entries))return;for(const [id,on]of entries){if(typeof on!=='boolean')continue;const [x,y]=id.split(',').map(Number);if(!validCoord(x)||!validCoord(y))continue;const d=describe(x,y),before=state(d);local.set(id,on);changed(d,before);}});
   function setMode(next){
-    if((mode==='local')!==(next==='local'))renderer?.clearChunks();
+    if((mode==='local')!==(next==='local'))surface?.reset();
     mode=next;
     $('mode').classList.toggle('connected',next==='online');$('mode').classList.toggle('pending',next==='connecting'||next==='offline');
     $('mode').hidden=next==='local';
@@ -125,7 +125,7 @@
       }
       lastRevision=Math.max(lastRevision,data.revision);remoteReady=true;setMode('online');connectStream(box,data.revision);flush();
       // Bounded in-memory state. The database is the durable record of distant cells.
-      if(remote.size>10000)for(const id of remote.keys()){const [x,y]=id.split(',').map(Number);if(x<box.x0-20||x>box.x1+20||y<box.y0-20||y>box.y1+20){remote.delete(id);versions.delete(id);renderer?.invalidateCell(x,y);}}
+      if(remote.size>10000)for(const id of remote.keys()){const [x,y]=id.split(',').map(Number);if(x<box.x0-20||x>box.x1+20||y<box.y0-20||y>box.y1+20){remote.delete(id);versions.delete(id);surface?.invalidate(x,y);}}
     }catch(e){if(e.name==='AbortError')return;activeBounds=null;setMode('offline');clearTimeout(streamTimer);streamTimer=setTimeout(reconnect,2000);}
   }
   function connectStream(box,revision){
@@ -151,22 +151,22 @@
   }
   function resize(){
     view.width=innerWidth;view.height=innerHeight;view.dpr=Math.min(devicePixelRatio||1,3);
-    canvas.width=Math.ceil(view.width*view.dpr);canvas.height=Math.ceil(view.height*view.dpr);clampCamera();invalidate();viewportChanged();
+    clampCamera();invalidate();viewportChanged();
   }
   function clampCamera(){const mx=Math.ceil(view.width/(2*view.zoom*W))+4,my=Math.ceil(view.height/(2*view.zoom*H))+4;view.cx=clamp(view.cx,(-MAX_COORD+mx)*W,(MAX_COORD-mx)*W);view.cy=clamp(view.cy,(-MAX_COORD+my)*H,(MAX_COORD-my)*H);}
   function worldAt(x,y){return {x:view.cx+(x-view.width/2)/view.zoom,y:view.cy+(y-view.height/2)/view.zoom};}
   function zoomAt(value,x=view.width/2,y=view.height/2){const a=worldAt(x,y);view.zoom=safeZoom(value);view.cx=a.x-(x-view.width/2)/view.zoom;view.cy=a.y-(y-view.height/2)/view.zoom;clampCamera();invalidate();viewportChanged();}
-  function interacted(){document.body.classList.remove('keyboard');$('instructions').style.opacity='.0';}
+  function interacted(){document.body.classList.remove('keyboard');}
   function pinchInfo(){const a=[...pointers.values()];return {x:(a[0].x+a[1].x)/2,y:(a[0].y+a[1].y)/2,d:Math.hypot(a[0].x-a[1].x,a[0].y-a[1].y)};}
-  canvas.addEventListener('pointerdown',e=>{
+  field.addEventListener('pointerdown',e=>{
     if(e.button!==0&&e.pointerType==='mouse')return;
-    e.preventDefault();canvas.focus({preventScroll:true});canvas.setPointerCapture(e.pointerId);
+    e.preventDefault();field.focus({preventScroll:true});field.setPointerCapture(e.pointerId);
     interacted();velocity.x=velocity.y=0;pointers.set(e.pointerId,{x:e.clientX,y:e.clientY});
     if(pointers.size===1){multi=false;pointerMoved=false;drag={x:e.clientX,y:e.clientY,startX:e.clientX,startY:e.clientY,time:e.timeStamp,start:e.timeStamp};}
     else if(pointers.size===2){multi=true;pinch=pinchInfo();drag=null;}
-    canvas.classList.add('dragging');
+    field.classList.add('dragging');
   });
-  canvas.addEventListener('pointermove',e=>{
+  field.addEventListener('pointermove',e=>{
     if(!pointers.has(e.pointerId))return;e.preventDefault();
     pointers.set(e.pointerId,{x:e.clientX,y:e.clientY});
     if(pointers.size>=2){const now=pinchInfo();if(pinch&&pinch.d>0){const a=worldAt(pinch.x,pinch.y);view.zoom=safeZoom(view.zoom*now.d/pinch.d);view.cx=a.x-(now.x-view.width/2)/view.zoom;view.cy=a.y-(now.y-view.height/2)/view.zoom;}pinch=now;pointerMoved=true;}
@@ -184,17 +184,17 @@
     if(cancelled||multi||reduced||!drag||e.timeStamp-drag.time>90)velocity.x=velocity.y=0;
     pointers.delete(e.pointerId);pinch=null;
     if(pointers.size===1){const p=[...pointers.values()][0];drag={...p,startX:p.x,startY:p.y,time:e.timeStamp,start:e.timeStamp};pointerMoved=true;}
-    else if(!pointers.size){drag=null;canvas.classList.remove('dragging');}
+    else if(!pointers.size){drag=null;field.classList.remove('dragging');}
     invalidate();viewportChanged();
   }
-  canvas.addEventListener('pointerup',e=>release(e));canvas.addEventListener('pointercancel',e=>release(e,true));
-  canvas.addEventListener('lostpointercapture',e=>{if(pointers.has(e.pointerId))release(e,true);});
-  canvas.addEventListener('contextmenu',e=>e.preventDefault());
-  canvas.addEventListener('wheel',e=>{e.preventDefault();interacted();velocity.x=velocity.y=0;const units=e.deltaMode===1?16:e.deltaMode===2?view.height:1;zoomAt(view.zoom*Math.exp(-e.deltaY*units*.0012),e.clientX,e.clientY);},{passive:false});
+  field.addEventListener('pointerup',e=>release(e));field.addEventListener('pointercancel',e=>release(e,true));
+  field.addEventListener('lostpointercapture',e=>{if(pointers.has(e.pointerId))release(e,true);});
+  field.addEventListener('contextmenu',e=>e.preventDefault());
+  field.addEventListener('wheel',e=>{e.preventDefault();interacted();velocity.x=velocity.y=0;const units=e.deltaMode===1?16:e.deltaMode===2?view.height:1;zoomAt(view.zoom*Math.exp(-e.deltaY*units*.0012),e.clientX,e.clientY);},{passive:false});
   addEventListener('keydown',e=>{
     if(about.open||e.target.closest('input,textarea,select'))return;
     if(e.target.closest('button')&&['Enter',' '].includes(e.key))return;
-    if(['ArrowLeft','ArrowRight','ArrowUp','ArrowDown'].includes(e.key)){e.preventDefault();keys.add(e.key);document.body.classList.add('keyboard');$('instructions').style.opacity='0';invalidate();}
+    if(['ArrowLeft','ArrowRight','ArrowUp','ArrowDown'].includes(e.key)){e.preventDefault();keys.add(e.key);document.body.classList.add('keyboard');invalidate();}
     else if(e.key==='+'||e.key==='='){e.preventDefault();zoomAt(view.zoom*1.15);}
     else if(e.key==='-'){e.preventDefault();zoomAt(view.zoom/1.15);}
     else if(e.key==='Home'){e.preventDefault();home();}
@@ -202,12 +202,12 @@
     else if(e.key==='Escape'){document.body.classList.remove('keyboard');}
   });
   addEventListener('keyup',e=>keys.delete(e.key));
-  function stop(){keys.clear();pointers.clear();velocity.x=velocity.y=0;drag=null;pinch=null;canvas.classList.remove('dragging');}
+  function stop(){keys.clear();pointers.clear();velocity.x=velocity.y=0;drag=null;pinch=null;field.classList.remove('dragging');}
   addEventListener('blur',stop);
   document.addEventListener('visibilitychange',()=>{if(document.hidden){stop();stream?.close();}else{invalidate();reconnect();}});
   addEventListener('online',reconnect);
   addEventListener('pagehide',()=>{try{localStorage.setItem(storeKey,JSON.stringify([...local]));}catch{}stream?.close();});
-  function home(){velocity.x=velocity.y=0;view.cx=W/2;view.cy=H/2;view.zoom=HOME_ZOOM;invalidate();viewportChanged();canvas.focus({preventScroll:true});}
+  function home(){velocity.x=velocity.y=0;view.cx=W/2;view.cy=H/2;view.zoom=HOME_ZOOM;invalidate();viewportChanged();field.focus({preventScroll:true});}
   function openAbout(){stop();about.showModal();} $('mode').onclick=openAbout;$('project-info').onclick=openAbout;$('close-about').onclick=()=>about.close();
   about.addEventListener('click',e=>{if(e.target!==about)return;const r=about.getBoundingClientRect();if(e.clientX<r.left||e.clientX>r.right||e.clientY<r.top||e.clientY>r.bottom)about.close();});
   addEventListener('resize',resize);
@@ -215,23 +215,30 @@
     frame=0;const dt=Math.min(40,lastTime?time-lastTime:16);lastTime=time;
     let moving=false;
     if(!pointers.size&&(Math.abs(velocity.x)+Math.abs(velocity.y)>.012)){
-      view.cx+=velocity.x*dt;view.cy+=velocity.y*dt;const f=Math.exp(-dt/150);velocity.x*=f;velocity.y*=f;moving=true;
+      // A fling slows down to what is already prepared instead of outrunning the painting.
+      const dx=velocity.x*dt,dy=velocity.y*dt,t=surface?surface.reach(view,dx,dy):1;
+      view.cx+=dx*t;view.cy+=dy*t;if(t<1){velocity.x*=t;velocity.y*=t;}
+      const f=Math.exp(-dt/150);velocity.x*=f;velocity.y*=f;moving=true;
     }
     if(keys.size){const dx=Number(keys.has('ArrowRight'))-Number(keys.has('ArrowLeft')),dy=Number(keys.has('ArrowDown'))-Number(keys.has('ArrowUp'));const norm=dx&&dy?Math.SQRT1_2:1;view.cx+=dx*.59*dt/view.zoom*norm;view.cy+=dy*.59*dt/view.zoom*norm;moving=true;}
     if(moving){clampCamera();dirty=true;viewportChanged();}
-    if(renderer&&dirty){
-      renderer.draw(ctx,view,state);dirty=false;
+    if(surface&&(dirty||busy)){
+      // The surface keeps painting in small portions until the frame and its neighbours are ready.
+      busy=surface.update(view,state,time);dirty=false;
+      // The title moves from the centre to its corner once the facade is complete.
+      if(surface.shown&&document.body.classList.contains('loading'))document.body.classList.remove('loading');
       const x=Math.floor(view.cx/W),y=Math.floor(view.cy/H);
       if(x!==lastLabelX||y!==lastLabelY){$('coordinates').textContent=`${coordinateFormat.format(x)} · ${coordinateFormat.format(-y||0)}`;lastLabelX=x;lastLabelY=y;}
       if(view.zoom!==lastLabelZoom){$('scale-label').textContent=`${zoomFormat.format(view.zoom*100)}%`;lastLabelZoom=view.zoom;}
       if(document.body.classList.contains('keyboard')){const f=$('focus-cell');f.style.left=`${(x*W-view.cx)*view.zoom+view.width/2}px`;f.style.top=`${(y*H-view.cy)*view.zoom+view.height/2}px`;f.style.width=`${W*view.zoom}px`;f.style.height=`${H*view.zoom}px`;}
     }
-    if(moving||keys.size)frame=requestAnimationFrame(tick);
+    if(moving||keys.size||busy)frame=requestAnimationFrame(tick);
   }
   try {
     const data=JSON.parse($('texture-data').textContent),images={};
     await Promise.all(Object.entries(data).map(([key,src])=>new Promise((resolve,reject)=>{const im=new Image();im.onload=()=>{images[key]=im;resolve();};im.onerror=reject;im.src=src;})));
-    renderer=new Renderer(images,(w,h)=>{const c=document.createElement('canvas');c.width=w;c.height=h;return c;},{explicitInvalidation:true,maxResolution:4,cacheBudget:(coarse?56:96)*1024*1024,scheduleIdle:callback=>typeof requestIdleCallback==='function'?requestIdleCallback(callback,{timeout:1000}):setTimeout(()=>callback({timeRemaining:()=>5}),16)});
+    const renderer=new Renderer(images,(w,h)=>{const c=document.createElement('canvas');c.width=w;c.height=h;return c;},{dpr:view.dpr});
+    surface=new Surface(renderer,$('tiles'),{maxResolution:4,budget:(coarse?112:256)*1024*1024});
     // Release embedded base64 text after decoding; the images remain alive in the renderer.
     $('texture-data').remove();resize();await detectServer();
   }catch(e){console.error(e);tell('Не удалось открыть фактуры. Перезагрузите страницу.',15000);}
